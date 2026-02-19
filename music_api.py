@@ -267,22 +267,23 @@ class NeteaseAPI:
         except json.JSONDecodeError as e:
             raise APIException(f"解析歌词响应失败: {e}")
     
-    def search_music(self, keywords: str, cookies: Dict[str, str], limit: int = 10) -> List[Dict[str, Any]]:
+    def search_music(self, keywords: str, cookies: Dict[str, str], limit: int = 10, search_type: int = 1) -> List[Dict[str, Any]]:
         """搜索音乐
         
         Args:
             keywords: 搜索关键词
             cookies: 用户cookies
             limit: 返回数量限制
+            search_type: 搜索类型 (1: 单曲, 10: 专辑, 100: 歌手, 1000: 歌单)
             
         Returns:
-            歌曲信息列表
+            搜索结果列表
             
         Raises:
             APIException: API调用失败时抛出
         """
         try:
-            data = {'s': keywords, 'type': 1, 'limit': limit}
+            data = {'s': keywords, 'type': search_type, 'limit': limit}
             headers = {
                 'User-Agent': APIConstants.USER_AGENT,
                 'Referer': APIConstants.REFERER
@@ -296,18 +297,50 @@ class NeteaseAPI:
             if result.get('code') != 200:
                 raise APIException(f"搜索失败: {result.get('message', '未知错误')}")
             
-            songs = []
-            for item in result.get('result', {}).get('songs', []):
-                song_info = {
-                    'id': item['id'],
-                    'name': item['name'],
-                    'artists': '/'.join(artist['name'] for artist in item['ar']),
-                    'album': item['al']['name'],
-                    'picUrl': item['al']['picUrl']
-                }
-                songs.append(song_info)
             
-            return songs
+            results = []
+            
+            # 根据类型处理不同的返回结果
+            if search_type == 1:  # 单曲
+                for item in result.get('result', {}).get('songs', []):
+                    song_info = {
+                        'id': item['id'],
+                        'name': item['name'],
+                        'artists': '/'.join(artist['name'] for artist in item['ar']),
+                        'album': item['al']['name'],
+                        'picUrl': item['al']['picUrl']
+                    }
+                    results.append(song_info)
+            
+            elif search_type == 10:  # 专辑
+                for item in result.get('result', {}).get('albums', []):
+                    album_info = {
+                        'id': item['id'],
+                        'name': item['name'],
+                        'artist': item['artist']['name'],
+                        'picUrl': item['picUrl'],
+                        'publishTime': item['publishTime'],
+                        'size': item['size'],
+                        'description': "" 
+                    }
+                    results.append(album_info)
+            
+            elif search_type == 1000:  # 歌单
+                for item in result.get('result', {}).get('playlists', []):
+                    # 获取创建者信息，防止 missing key
+                    creator = item.get('creator') or {}
+                    playlist_info = {
+                        'id': str(item.get('id')),
+                        'name': item.get('name'),
+                        'coverImgUrl': item.get('coverImgUrl'),
+                        'creator': {'nickname': creator.get('nickname', '未知')},
+                        'trackCount': item['trackCount'],
+                        'playCount': item['playCount'],
+                        'description': item['description']
+                    }
+                    results.append(playlist_info)
+            
+            return results
         except requests.RequestException as e:
             raise APIException(f"搜索请求失败: {e}")
         except (json.JSONDecodeError, KeyError) as e:
@@ -339,38 +372,56 @@ class NeteaseAPI:
             
             result = response.json()
             if result.get('code') != 200:
-                raise APIException(f"获取歌单详情失败: {result.get('message', '未知错误')}")
+                raise APIException(f"获取歌单详情失败: {result.get('code')} - {result.get('message', '未知错误')}")
             
-            playlist = result.get('playlist', {})
+            playlist = result.get('playlist') or {}
+            creator = playlist.get('creator') or {}
             info = {
-                'id': playlist.get('id'),
+                'id': str(playlist.get('id')),
                 'name': playlist.get('name'),
                 'coverImgUrl': playlist.get('coverImgUrl'),
-                'creator': playlist.get('creator', {}).get('nickname', ''),
+                'creator': creator.get('nickname', ''),
                 'trackCount': playlist.get('trackCount'),
                 'description': playlist.get('description', ''),
                 'tracks': []
             }
             
             # 获取所有trackIds并分批获取详细信息
-            track_ids = [str(t['id']) for t in playlist.get('trackIds', [])]
+            track_ids_data = playlist.get('trackIds') or []
+            track_ids = [str(t['id']) for t in track_ids_data if t and t.get('id')]
+            
             for i in range(0, len(track_ids), 100):
                 batch_ids = track_ids[i:i+100]
-                song_data = {'c': json.dumps([{'id': int(sid), 'v': 0} for sid in batch_ids])}
+                if not batch_ids: continue
                 
-                song_resp = requests.post(APIConstants.SONG_DETAIL_V3, data=song_data, 
-                                        headers=headers, cookies=cookies, timeout=30)
-                song_resp.raise_for_status()
-                
-                song_result = song_resp.json()
-                for song in song_result.get('songs', []):
-                    info['tracks'].append({
-                        'id': song['id'],
-                        'name': song['name'],
-                        'artists': '/'.join(artist['name'] for artist in song['ar']),
-                        'album': song['al']['name'],
-                        'picUrl': song['al']['picUrl']
-                    })
+                try:
+                    song_data = {'c': json.dumps([{'id': int(sid), 'v': 0} for sid in batch_ids])}
+                    
+                    song_resp = requests.post(APIConstants.SONG_DETAIL_V3, data=song_data, 
+                                            headers=headers, cookies=cookies, timeout=30)
+                    # 允许部分失败，不抛出异常
+                    if song_resp.status_code != 200:
+                        print(f"获取歌曲详情失败 (batch {i}): HTTP {song_resp.status_code}")
+                        continue
+                    
+                    song_result = song_resp.json()
+                    songs_list = song_result.get('songs') or []
+                    for song in songs_list:
+                        if not song: continue
+                        # 安全获取 nested dict
+                        al = song.get('al') or {}
+                        ar = song.get('ar') or []
+                        
+                        info['tracks'].append({
+                            'id': song.get('id'),
+                            'name': song.get('name'),
+                            'artists': '/'.join(artist.get('name', '') for artist in ar),
+                            'album': al.get('name', ''),
+                            'picUrl': al.get('picUrl', '')
+                        })
+                except Exception as e:
+                     print(f"处理歌曲批次失败 (batch {i}): {e}")
+                     continue
             
             return info
         except requests.RequestException as e:
@@ -631,10 +682,10 @@ def lyric_v1(song_id: int, cookies: Dict[str, str]) -> Dict[str, Any]:
     return api.get_lyric(song_id, cookies)
 
 
-def search_music(keywords: str, cookies: Dict[str, str], limit: int = 10) -> List[Dict[str, Any]]:
+def search_music(keywords: str, cookies: Dict[str, str], limit: int = 10, search_type: int = 1) -> List[Dict[str, Any]]:
     """搜索音乐（向后兼容）"""
     api = NeteaseAPI()
-    return api.search_music(keywords, cookies, limit)
+    return api.search_music(keywords, cookies, limit, search_type)
 
 
 def playlist_detail(playlist_id: int, cookies: Dict[str, str]) -> Dict[str, Any]:
